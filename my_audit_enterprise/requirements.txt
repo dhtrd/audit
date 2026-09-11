@@ -1,0 +1,2 @@
+# Built using the Python standard library only - zero external Python dependencies.
+# NOTE: the browser UI loads SheetJS + Google Fonts from a CDN, so Excel import needs internet.
