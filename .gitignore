@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Local audit databases (created at runtime)
+*.db
