@@ -31,6 +31,7 @@ import os
 import re
 import json
 import hmac
+import base64
 import hashlib
 import secrets
 import sqlite3
@@ -39,10 +40,15 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from http.cookies import SimpleCookie
 import urllib.parse
 
-DB_PATH = os.environ.get('MY_AUDIT_BACKEND_DB', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'audit_backend.db'))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.environ.get('MY_AUDIT_BACKEND_DB', os.path.join(_HERE, 'audit_backend.db'))
 PORT = int(os.environ.get('MY_AUDIT_BACKEND_PORT', '8090'))
+EVIDENCE_DIR = os.environ.get('MY_AUDIT_EVIDENCE_DIR', os.path.join(_HERE, 'evidence'))
+BACKUP_DIR = os.environ.get('MY_AUDIT_BACKUP_DIR', os.path.join(_HERE, 'backups'))
+BACKUP_KEY = os.environ.get('MY_AUDIT_BACKUP_KEY', '')  # passphrase for encrypted backups
 SESSION_TTL_HOURS = 12
 PBKDF2_ROUNDS = 200_000
+MAX_EVIDENCE_BYTES = int(os.environ.get('MY_AUDIT_MAX_EVIDENCE', str(25 * 1024 * 1024)))
 
 # ----------------------------------------------------------------------------
 # RBAC: role -> set of permissions. '*' means every permission.
@@ -50,11 +56,14 @@ PBKDF2_ROUNDS = 200_000
 ROLE_PERMISSIONS = {
     'admin':            {'*'},
     'internal_auditor': {'risk.read', 'risk.write', 'control.read', 'control.write',
-                         'finding.read', 'finding.write', 'audit.read'},
+                         'finding.read', 'finding.write', 'audit.read',
+                         'evidence.read', 'evidence.write', 'pbc.fulfill', 'report.read'},
     'manager':          {'risk.read', 'control.read', 'finding.read', 'finding.write',
-                         'finding.close', 'audit.read'},
-    'external_auditor': {'finding.read', 'control.read'},
-    'viewer':           {'risk.read', 'control.read', 'finding.read'},
+                         'finding.close', 'audit.read',
+                         'evidence.read', 'pbc.fulfill', 'report.read'},
+    'external_auditor': {'finding.read', 'control.read',
+                         'evidence.read', 'pbc.request', 'pbc.review', 'report.read'},
+    'viewer':           {'risk.read', 'control.read', 'finding.read', 'report.read'},
 }
 VALID_ROLES = set(ROLE_PERMISSIONS.keys())
 
@@ -161,6 +170,36 @@ def init_db():
         created_at TEXT,
         updated_at TEXT
     );
+    -- Phase 2: tamper-evident evidence (SHA-256 of the stored bytes).
+    CREATE TABLE IF NOT EXISTS evidence (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        engagement_id TEXT NOT NULL DEFAULT 'default',
+        entity TEXT NOT NULL,          -- risks | controls | findings | pbc
+        entity_id TEXT,
+        filename TEXT NOT NULL,
+        sha256 TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        note TEXT,
+        path TEXT NOT NULL,
+        uploaded_by INTEGER,
+        uploaded_by_name TEXT,
+        created_at TEXT NOT NULL
+    );
+    -- Phase 3: Prepared-By-Client requests (external-auditor workflow).
+    CREATE TABLE IF NOT EXISTS pbc_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        engagement_id TEXT NOT NULL DEFAULT 'default',
+        title TEXT NOT NULL,
+        description TEXT,
+        status TEXT NOT NULL DEFAULT 'requested',   -- requested|in_progress|submitted|accepted|rejected
+        requested_by INTEGER,
+        requested_by_name TEXT,
+        assigned_to TEXT,
+        due_date TEXT,
+        review_note TEXT,
+        created_at TEXT,
+        updated_at TEXT
+    );
     """)
     conn.commit()
     conn.close()
@@ -246,6 +285,85 @@ def resolve_session(conn, token):
     if not row['active']:
         return None
     return row
+
+
+def ensure_dirs():
+    for d in (EVIDENCE_DIR, BACKUP_DIR):
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            pass
+
+
+# ----------------------------------------------------------------------------
+# Encrypted backup (stdlib only): PBKDF2 key -> SHA-256 CTR keystream, encrypt-
+# then-MAC with HMAC-SHA256. Authenticated and password-based.
+# NOTE: this is a standard-library construction so the project stays dependency
+# free. For production prefer a vetted AEAD (AES-GCM via `cryptography`) or an
+# external tool (`age` / `gpg`); the on-disk format below is versioned to allow
+# swapping the cipher without breaking older archives.
+# ----------------------------------------------------------------------------
+_BACKUP_MAGIC = b'MYAB1'
+
+
+def _derive_key(password, salt):
+    return hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, PBKDF2_ROUNDS, dklen=64)
+
+
+def _keystream(key_enc, nonce, n):
+    out = bytearray()
+    counter = 0
+    while len(out) < n:
+        out += hashlib.sha256(key_enc + nonce + counter.to_bytes(8, 'big')).digest()
+        counter += 1
+    return bytes(out[:n])
+
+
+def encrypt_blob(plaintext, password):
+    salt = secrets.token_bytes(16)
+    nonce = secrets.token_bytes(16)
+    dk = _derive_key(password, salt)
+    ke, km = dk[:32], dk[32:]
+    ks = _keystream(ke, nonce, len(plaintext))
+    ct = bytes(a ^ b for a, b in zip(plaintext, ks))
+    mac = hmac.new(km, salt + nonce + ct, hashlib.sha256).digest()
+    return _BACKUP_MAGIC + salt + nonce + mac + ct
+
+
+def decrypt_blob(blob, password):
+    if blob[:5] != _BACKUP_MAGIC:
+        raise ValueError('unrecognized backup format')
+    salt, nonce, mac, ct = blob[5:21], blob[21:37], blob[37:69], blob[69:]
+    dk = _derive_key(password, salt)
+    ke, km = dk[:32], dk[32:]
+    if not hmac.compare_digest(mac, hmac.new(km, salt + nonce + ct, hashlib.sha256).digest()):
+        raise ValueError('authentication failed (wrong password or corrupted archive)')
+    ks = _keystream(ke, nonce, len(ct))
+    return bytes(a ^ b for a, b in zip(ct, ks))
+
+
+def make_encrypted_backup(password):
+    """Consistent SQLite snapshot -> encrypted archive on disk. Returns metadata."""
+    ensure_dirs()
+    # Consistent snapshot via the SQLite online-backup API (safe while serving).
+    tmp = os.path.join(BACKUP_DIR, '.snapshot.tmp')
+    src = get_db()
+    dst = sqlite3.connect(tmp)
+    with dst:
+        src.backup(dst)
+    dst.close()
+    src.close()
+    with open(tmp, 'rb') as f:
+        raw = f.read()
+    os.remove(tmp)
+    blob = encrypt_blob(raw, password)
+    ts = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+    name = 'audit-backup-%s.enc' % ts
+    path = os.path.join(BACKUP_DIR, name)
+    with open(path, 'wb') as f:
+        f.write(blob)
+    return {'file': name, 'path': path, 'plain_size': len(raw), 'enc_size': len(blob),
+            'sha256': hashlib.sha256(blob).hexdigest()}
 
 
 def audit(conn, actor, action, entity, entity_id, before, after, ip):
@@ -357,6 +475,35 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/audit-log' and method == 'GET':
                 return self._audit_log(conn, user)
 
+            # Phase 2 — evidence
+            if path == '/api/evidence' and method == 'GET':
+                return self._list_evidence(conn, user)
+            if path == '/api/evidence' and method == 'POST':
+                return self._upload_evidence(conn, user)
+            me = re.match(r'^/api/evidence/(\d+)/download$', path)
+            if me and method == 'GET':
+                return self._download_evidence(conn, user, int(me.group(1)))
+            me2 = re.match(r'^/api/evidence/(\d+)$', path)
+            if me2 and method == 'DELETE':
+                return self._delete_evidence(conn, user, int(me2.group(1)))
+
+            # Phase 2 — audit committee report
+            if path == '/api/reports/committee' and method == 'GET':
+                return self._committee_report(conn, user)
+
+            # Phase 3 — PBC (Prepared By Client)
+            if path == '/api/pbc' and method == 'GET':
+                return self._list_pbc(conn, user)
+            if path == '/api/pbc' and method == 'POST':
+                return self._create_pbc(conn, user)
+            mp = re.match(r'^/api/pbc/(\d+)$', path)
+            if mp and method == 'PUT':
+                return self._update_pbc(conn, user, int(mp.group(1)))
+
+            # Phase 3 — encrypted backup
+            if path == '/api/backup' and method == 'POST':
+                return self._backup(conn, user)
+
             # entity collections:  /api/<entity>  and  /api/<entity>/<id>
             m = re.match(r'^/api/(risks|controls|findings)(?:/(\d+))?$', path)
             if m:
@@ -428,6 +575,224 @@ class Handler(BaseHTTPRequestHandler):
             raise PermissionError('missing audit.read')
         rows = conn.execute('SELECT * FROM audit_log ORDER BY id DESC LIMIT 500').fetchall()
         return self._send(200, {'entries': [row_to_dict(r) for r in rows]})
+
+    # ---- Phase 2: evidence ----
+    def _upload_evidence(self, conn, user):
+        if not has_permission(user['role'], 'evidence.write'):
+            raise PermissionError('missing evidence.write')
+        data = self._body_json()
+        entity = (data.get('entity') or '').strip()
+        if entity not in ('risks', 'controls', 'findings', 'pbc'):
+            raise ValueError('entity must be one of risks|controls|findings|pbc')
+        filename = (data.get('filename') or 'evidence.bin').strip()
+        b64 = data.get('content_b64') or ''
+        try:
+            content = base64.b64decode(b64, validate=True)
+        except Exception:
+            raise ValueError('content_b64 must be valid base64')
+        if not content:
+            raise ValueError('empty content')
+        if len(content) > MAX_EVIDENCE_BYTES:
+            raise ValueError('evidence exceeds size limit')
+        ensure_dirs()
+        sha = hashlib.sha256(content).hexdigest()
+        stored = 'ev_%s_%s.bin' % (datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S'), secrets.token_hex(6))
+        path = os.path.join(EVIDENCE_DIR, stored)
+        with open(path, 'wb') as f:
+            f.write(content)
+        cur = conn.execute(
+            'INSERT INTO evidence (engagement_id, entity, entity_id, filename, sha256, size, note, path, uploaded_by, uploaded_by_name, created_at) '
+            'VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+            ('default', entity, str(data.get('entity_id') or ''), filename, sha, len(content),
+             data.get('note') or '', path, user['id'], user['username'], now_iso()))
+        conn.commit()
+        row = conn.execute('SELECT * FROM evidence WHERE id=?', (cur.lastrowid,)).fetchone()
+        meta = self._evidence_meta(row)
+        audit(conn, user, 'evidence.upload', 'evidence', cur.lastrowid, None, meta, self._client_ip())
+        return self._send(201, {'evidence': meta})
+
+    def _evidence_meta(self, row):
+        return {'id': row['id'], 'entity': row['entity'], 'entity_id': row['entity_id'],
+                'filename': row['filename'], 'sha256': row['sha256'], 'size': row['size'],
+                'note': row['note'], 'uploaded_by': row['uploaded_by_name'], 'created_at': row['created_at']}
+
+    def _list_evidence(self, conn, user):
+        if not has_permission(user['role'], 'evidence.read'):
+            raise PermissionError('missing evidence.read')
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        entity = (q.get('entity', [None])[0])
+        entity_id = (q.get('entity_id', [None])[0])
+        sql, args = 'SELECT * FROM evidence', []
+        conds = []
+        if entity:
+            conds.append('entity=?'); args.append(entity)
+        if entity_id:
+            conds.append('entity_id=?'); args.append(str(entity_id))
+        if conds:
+            sql += ' WHERE ' + ' AND '.join(conds)
+        sql += ' ORDER BY id DESC'
+        rows = conn.execute(sql, args).fetchall()
+        return self._send(200, {'evidence': [self._evidence_meta(r) for r in rows]})
+
+    def _download_evidence(self, conn, user, ev_id):
+        if not has_permission(user['role'], 'evidence.read'):
+            raise PermissionError('missing evidence.read')
+        row = conn.execute('SELECT * FROM evidence WHERE id=?', (ev_id,)).fetchone()
+        if not row:
+            return self._send(404, {'error': 'not_found'})
+        try:
+            with open(row['path'], 'rb') as f:
+                content = f.read()
+        except Exception:
+            return self._send(410, {'error': 'file_missing'})
+        # Tamper check: recompute the hash and compare with the stored one.
+        verified = hmac.compare_digest(hashlib.sha256(content).hexdigest(), row['sha256'])
+        audit(conn, user, 'evidence.download', 'evidence', ev_id, None, {'verified': verified}, self._client_ip())
+        return self._send(200, {'filename': row['filename'], 'sha256': row['sha256'], 'verified': verified,
+                                'content_b64': base64.b64encode(content).decode('ascii')})
+
+    def _delete_evidence(self, conn, user, ev_id):
+        if not has_permission(user['role'], 'evidence.delete') and not has_permission(user['role'], '*'):
+            raise PermissionError('deleting evidence requires an administrator')
+        row = conn.execute('SELECT * FROM evidence WHERE id=?', (ev_id,)).fetchone()
+        if not row:
+            return self._send(404, {'error': 'not_found'})
+        try:
+            os.remove(row['path'])
+        except Exception:
+            pass
+        conn.execute('DELETE FROM evidence WHERE id=?', (ev_id,))
+        conn.commit()
+        audit(conn, user, 'evidence.delete', 'evidence', ev_id, self._evidence_meta(row), None, self._client_ip())
+        return self._send(200, {'ok': True})
+
+    # ---- Phase 2: audit committee report ----
+    def _committee_report(self, conn, user):
+        if not has_permission(user['role'], 'report.read'):
+            raise PermissionError('missing report.read')
+
+        def band(score):
+            return 'low' if score <= 4 else ('medium' if score <= 9 else ('high' if score <= 15 else 'critical'))
+
+        risks = conn.execute('SELECT * FROM risks').fetchall()
+        risk_bands = {'low': 0, 'medium': 0, 'high': 0, 'critical': 0}
+        top = []
+        for r in risks:
+            inh = (r['likelihood'] or 1) * (r['impact'] or 1)
+            risk_bands[band(inh)] += 1
+            top.append({'title': r['title'], 'inherent': inh})
+        top.sort(key=lambda x: -x['inherent'])
+
+        controls = conn.execute('SELECT * FROM controls').fetchall()
+        ctrl = {'effective': 0, 'partial': 0, 'ineffective': 0, 'untested': 0}
+        for c in controls:
+            if c['design'] in ('لا', 'No'):
+                ctrl['ineffective'] += 1
+            elif (c['sample_size'] or 0) <= 0:
+                ctrl['untested'] += 1
+            elif (c['exceptions'] or 0) == 0:
+                ctrl['effective'] += 1
+            elif (c['exceptions'] / c['sample_size']) <= 0.1:
+                ctrl['partial'] += 1
+            else:
+                ctrl['ineffective'] += 1
+
+        findings = conn.execute('SELECT * FROM findings').fetchall()
+        f_status, f_priority = {}, {}
+        overdue = 0
+        prog_sum = 0
+        today = datetime.date.today().isoformat()
+        closed = ('مغلقة', 'Closed')
+        for f in findings:
+            f_status[f['status'] or 'غير محدد'] = f_status.get(f['status'] or 'غير محدد', 0) + 1
+            f_priority[f['priority'] or 'غير محدد'] = f_priority.get(f['priority'] or 'غير محدد', 0) + 1
+            prog_sum += (f['progress'] or 0)
+            if f['due_date'] and f['due_date'] < today and f['status'] not in closed:
+                overdue += 1
+        avg_prog = round(prog_sum / len(findings), 1) if findings else 0
+
+        pbc = conn.execute('SELECT status, COUNT(*) AS n FROM pbc_requests GROUP BY status').fetchall()
+        pbc_status = {r['status']: r['n'] for r in pbc}
+
+        report = {
+            'generated_at': now_iso(),
+            'risks': {'total': len(risks), 'by_band': risk_bands, 'top': top[:5]},
+            'controls': {'total': len(controls), 'effectiveness': ctrl},
+            'findings': {'total': len(findings), 'by_status': f_status, 'by_priority': f_priority,
+                         'overdue': overdue, 'avg_progress': avg_prog},
+            'pbc': {'by_status': pbc_status},
+        }
+        audit(conn, user, 'report.committee', 'report', None, None, None, self._client_ip())
+        return self._send(200, {'report': report})
+
+    # ---- Phase 3: PBC (Prepared By Client) ----
+    def _pbc_meta(self, row):
+        return row_to_dict(row)
+
+    def _create_pbc(self, conn, user):
+        if not has_permission(user['role'], 'pbc.request') and not has_permission(user['role'], '*'):
+            raise PermissionError('creating a PBC request requires the external auditor')
+        data = self._body_json()
+        if not (data.get('title') or '').strip():
+            raise ValueError('title is required')
+        cur = conn.execute(
+            'INSERT INTO pbc_requests (engagement_id, title, description, status, requested_by, requested_by_name, due_date, created_at, updated_at) '
+            'VALUES (?,?,?,?,?,?,?,?,?)',
+            ('default', data['title'], data.get('description') or '', 'requested',
+             user['id'], user['username'], data.get('due_date') or '', now_iso(), now_iso()))
+        conn.commit()
+        row = conn.execute('SELECT * FROM pbc_requests WHERE id=?', (cur.lastrowid,)).fetchone()
+        audit(conn, user, 'pbc.create', 'pbc', cur.lastrowid, None, row_to_dict(row), self._client_ip())
+        return self._send(201, {'pbc': row_to_dict(row)})
+
+    def _list_pbc(self, conn, user):
+        if not any(has_permission(user['role'], p) for p in ('pbc.request', 'pbc.fulfill', 'pbc.review')) \
+           and not has_permission(user['role'], '*'):
+            raise PermissionError('no PBC access')
+        rows = conn.execute('SELECT * FROM pbc_requests ORDER BY id DESC').fetchall()
+        return self._send(200, {'pbc': [row_to_dict(r) for r in rows]})
+
+    def _update_pbc(self, conn, user, pbc_id):
+        before = conn.execute('SELECT * FROM pbc_requests WHERE id=?', (pbc_id,)).fetchone()
+        if not before:
+            return self._send(404, {'error': 'not_found'})
+        data = self._body_json()
+        new_status = data.get('status')
+        VALID = ('requested', 'in_progress', 'submitted', 'accepted', 'rejected')
+        if new_status and new_status not in VALID:
+            raise ValueError('invalid status')
+        # Fulfilment (client side) vs review (external auditor) require different perms.
+        if new_status in ('in_progress', 'submitted') or 'assigned_to' in data:
+            if not has_permission(user['role'], 'pbc.fulfill') and not has_permission(user['role'], '*'):
+                raise PermissionError('fulfilling a PBC request requires pbc.fulfill')
+        if new_status in ('accepted', 'rejected'):
+            if not has_permission(user['role'], 'pbc.review') and not has_permission(user['role'], '*'):
+                raise PermissionError('reviewing a PBC request requires pbc.review')
+        sets, vals = [], []
+        for f in ('status', 'assigned_to', 'due_date', 'review_note', 'description'):
+            if f in data:
+                sets.append('%s=?' % f); vals.append(data[f])
+        if not sets:
+            raise ValueError('no updatable fields provided')
+        sets.append('updated_at=?'); vals.append(now_iso()); vals.append(pbc_id)
+        conn.execute('UPDATE pbc_requests SET %s WHERE id=?' % ','.join(sets), vals)
+        conn.commit()
+        after = conn.execute('SELECT * FROM pbc_requests WHERE id=?', (pbc_id,)).fetchone()
+        audit(conn, user, 'pbc.update', 'pbc', pbc_id, row_to_dict(before), row_to_dict(after), self._client_ip())
+        return self._send(200, {'pbc': row_to_dict(after)})
+
+    # ---- Phase 3: encrypted backup ----
+    def _backup(self, conn, user):
+        if not has_permission(user['role'], 'backup.run') and not has_permission(user['role'], '*'):
+            raise PermissionError('running a backup requires an administrator')
+        data = self._body_json()
+        password = data.get('password') or BACKUP_KEY
+        if not password:
+            raise ValueError('a backup password is required (body.password or MY_AUDIT_BACKUP_KEY)')
+        meta = make_encrypted_backup(password)
+        audit(conn, user, 'backup.run', 'backup', meta['file'],
+              None, {'sha256': meta['sha256'], 'enc_size': meta['enc_size']}, self._client_ip())
+        return self._send(201, {'backup': meta})
 
     # ---- entities ----
     def _list_entities(self, conn, user, entity):
@@ -507,6 +872,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def run_server():
     init_db()
+    ensure_dirs()
     bootstrap_admin()
     httpd = ThreadingHTTPServer(('0.0.0.0', PORT), Handler)
     print('Internal Audit backend (Type 2 / Phase 1) on http://localhost:%d' % PORT)
