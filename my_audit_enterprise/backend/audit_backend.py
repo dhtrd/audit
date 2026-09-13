@@ -57,13 +57,19 @@ ROLE_PERMISSIONS = {
     'admin':            {'*'},
     'internal_auditor': {'risk.read', 'risk.write', 'control.read', 'control.write',
                          'finding.read', 'finding.write', 'audit.read',
-                         'evidence.read', 'evidence.write', 'pbc.fulfill', 'report.read'},
+                         'evidence.read', 'evidence.write', 'pbc.fulfill', 'report.read',
+                         'universe.read', 'universe.write', 'plan.read', 'plan.write',
+                         'engagement.read', 'engagement.write', 'wp.read', 'wp.write',
+                         'wp.review', 'data.validate'},
     'manager':          {'risk.read', 'control.read', 'finding.read', 'finding.write',
                          'finding.close', 'audit.read',
-                         'evidence.read', 'pbc.fulfill', 'report.read'},
+                         'evidence.read', 'pbc.fulfill', 'report.read',
+                         'universe.read', 'plan.read', 'plan.write', 'engagement.read',
+                         'wp.read', 'wp.review', 'wp.approve', 'data.validate'},
     'external_auditor': {'finding.read', 'control.read',
                          'evidence.read', 'pbc.request', 'pbc.review', 'report.read'},
-    'viewer':           {'risk.read', 'control.read', 'finding.read', 'report.read'},
+    'viewer':           {'risk.read', 'control.read', 'finding.read', 'report.read',
+                         'universe.read', 'plan.read', 'engagement.read', 'wp.read'},
 }
 VALID_ROLES = set(ROLE_PERMISSIONS.keys())
 
@@ -184,6 +190,61 @@ def init_db():
         uploaded_by INTEGER,
         uploaded_by_name TEXT,
         created_at TEXT NOT NULL
+    );
+    -- Audit Universe: the population of auditable activities/processes.
+    CREATE TABLE IF NOT EXISTS audit_universe (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        engagement_id TEXT NOT NULL DEFAULT 'default',
+        title TEXT NOT NULL,
+        department TEXT,
+        description TEXT,
+        risk_score INTEGER NOT NULL DEFAULT 0,
+        last_reviewed TEXT,
+        created_by INTEGER, created_at TEXT, updated_at TEXT
+    );
+    -- Annual risk-based audit plan (each row plans one activity in a period).
+    CREATE TABLE IF NOT EXISTS audit_plans (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        engagement_id TEXT NOT NULL DEFAULT 'default',
+        title TEXT NOT NULL,
+        fiscal_year TEXT,
+        activity_id INTEGER,
+        quarter TEXT,
+        priority TEXT,
+        planned_hours INTEGER NOT NULL DEFAULT 0,
+        status TEXT,
+        created_by INTEGER, created_at TEXT, updated_at TEXT
+    );
+    -- Audit engagements (independent audit files).
+    CREATE TABLE IF NOT EXISTS engagements (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        engagement_id TEXT NOT NULL DEFAULT 'default',
+        title TEXT NOT NULL,
+        objective TEXT,
+        scope TEXT,
+        period_from TEXT,
+        period_to TEXT,
+        materiality TEXT,
+        lead_auditor TEXT,
+        status TEXT,
+        created_by INTEGER, created_at TEXT, updated_at TEXT
+    );
+    -- Workpapers with a Prepared -> Reviewed -> Approved -> Locked lifecycle.
+    CREATE TABLE IF NOT EXISTS workpapers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        engagement_ref INTEGER,
+        engagement_id TEXT NOT NULL DEFAULT 'default',
+        title TEXT NOT NULL,
+        objective TEXT,
+        procedure TEXT,
+        comments TEXT,
+        status TEXT NOT NULL DEFAULT 'prepared',
+        version INTEGER NOT NULL DEFAULT 1,
+        prepared_by INTEGER, prepared_by_name TEXT,
+        reviewed_by INTEGER, reviewed_by_name TEXT, reviewed_at TEXT,
+        approved_by INTEGER, approved_by_name TEXT, approved_at TEXT,
+        locked_at TEXT,
+        created_by INTEGER, created_at TEXT, updated_at TEXT
     );
     -- Phase 3: Prepared-By-Client requests (external-auditor workflow).
     CREATE TABLE IF NOT EXISTS pbc_requests (
@@ -384,8 +445,14 @@ ENTITY_FIELDS = {
     'risks': ['title', 'category', 'owner', 'likelihood', 'impact', 'control_strength', 'response', 'status', 'description'],
     'controls': ['title', 'risk_id', 'type', 'frequency', 'owner', 'design', 'sample_size', 'exceptions', 'description'],
     'findings': ['title', 'priority', 'owner', 'due_date', 'progress', 'status', 'condition', 'criteria', 'cause', 'effect', 'recommendation'],
+    'universe': ['title', 'department', 'description', 'risk_score', 'last_reviewed'],
+    'plans': ['title', 'fiscal_year', 'activity_id', 'quarter', 'priority', 'planned_hours', 'status'],
+    'engagements': ['title', 'objective', 'scope', 'period_from', 'period_to', 'materiality', 'lead_auditor', 'status'],
 }
-ENTITY_PERM = {'risks': 'risk', 'controls': 'control', 'findings': 'finding'}
+ENTITY_PERM = {'risks': 'risk', 'controls': 'control', 'findings': 'finding',
+               'universe': 'universe', 'plans': 'plan', 'engagements': 'engagement'}
+ENTITY_TABLE = {'risks': 'risks', 'controls': 'controls', 'findings': 'findings',
+                'universe': 'audit_universe', 'plans': 'audit_plans', 'engagements': 'engagements'}
 
 
 def row_to_dict(row):
@@ -504,8 +571,26 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/backup' and method == 'POST':
                 return self._backup(conn, user)
 
+            # Workpapers (custom lifecycle) — must precede the generic matcher.
+            if path == '/api/workpapers' and method == 'GET':
+                return self._list_workpapers(conn, user)
+            if path == '/api/workpapers' and method == 'POST':
+                return self._create_workpaper(conn, user)
+            mwt = re.match(r'^/api/workpapers/(\d+)/transition$', path)
+            if mwt and method == 'POST':
+                return self._transition_workpaper(conn, user, int(mwt.group(1)))
+            mw = re.match(r'^/api/workpapers/(\d+)$', path)
+            if mw and method == 'PUT':
+                return self._update_workpaper(conn, user, int(mw.group(1)))
+            if mw and method == 'DELETE':
+                return self._delete_workpaper(conn, user, int(mw.group(1)))
+
+            # Data-quality / validation engine
+            if path == '/api/validate' and method == 'POST':
+                return self._validate_data(conn, user)
+
             # entity collections:  /api/<entity>  and  /api/<entity>/<id>
-            m = re.match(r'^/api/(risks|controls|findings)(?:/(\d+))?$', path)
+            m = re.match(r'^/api/(risks|controls|findings|universe|plans|engagements)(?:/(\d+))?$', path)
             if m:
                 entity, ent_id = m.group(1), m.group(2)
                 if method == 'GET' and ent_id is None:
@@ -794,18 +879,196 @@ class Handler(BaseHTTPRequestHandler):
               None, {'sha256': meta['sha256'], 'enc_size': meta['enc_size']}, self._client_ip())
         return self._send(201, {'backup': meta})
 
+    # ---- Workpapers with lifecycle (Prepared -> Reviewed -> Approved -> Locked) ----
+    def _list_workpapers(self, conn, user):
+        if not has_permission(user['role'], 'wp.read'):
+            raise PermissionError('missing wp.read')
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        eng = q.get('engagement_ref', [None])[0]
+        if eng:
+            rows = conn.execute('SELECT * FROM workpapers WHERE engagement_ref=? ORDER BY id DESC', (eng,)).fetchall()
+        else:
+            rows = conn.execute('SELECT * FROM workpapers ORDER BY id DESC').fetchall()
+        return self._send(200, {'workpapers': [row_to_dict(r) for r in rows]})
+
+    def _create_workpaper(self, conn, user):
+        if not has_permission(user['role'], 'wp.write'):
+            raise PermissionError('missing wp.write')
+        data = self._body_json()
+        if not (data.get('title') or '').strip():
+            raise ValueError('title is required')
+        cur = conn.execute(
+            'INSERT INTO workpapers (engagement_ref, title, objective, procedure, comments, status, version, '
+            'prepared_by, prepared_by_name, created_by, created_at, updated_at) '
+            'VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+            (data.get('engagement_ref'), data['title'], data.get('objective') or '', data.get('procedure') or '',
+             data.get('comments') or '', 'prepared', int(data.get('version') or 1),
+             user['id'], user['username'], user['id'], now_iso(), now_iso()))
+        conn.commit()
+        row = conn.execute('SELECT * FROM workpapers WHERE id=?', (cur.lastrowid,)).fetchone()
+        audit(conn, user, 'wp.create', 'workpapers', cur.lastrowid, None, row_to_dict(row), self._client_ip())
+        return self._send(201, {'workpaper': row_to_dict(row)})
+
+    def _update_workpaper(self, conn, user, wp_id):
+        if not has_permission(user['role'], 'wp.write'):
+            raise PermissionError('missing wp.write')
+        before = conn.execute('SELECT * FROM workpapers WHERE id=?', (wp_id,)).fetchone()
+        if not before:
+            return self._send(404, {'error': 'not_found'})
+        if before['status'] == 'locked' and not has_permission(user['role'], '*'):
+            raise PermissionError('a locked workpaper is immutable — reopen it to create a new version')
+        data = self._body_json()
+        sets, vals = [], []
+        for f in ('title', 'objective', 'procedure', 'comments', 'engagement_ref'):
+            if f in data:
+                sets.append('%s=?' % f); vals.append(data[f])
+        if not sets:
+            raise ValueError('no updatable fields provided')
+        sets.append('updated_at=?'); vals.append(now_iso()); vals.append(wp_id)
+        conn.execute('UPDATE workpapers SET %s WHERE id=?' % ','.join(sets), vals)
+        conn.commit()
+        after = conn.execute('SELECT * FROM workpapers WHERE id=?', (wp_id,)).fetchone()
+        audit(conn, user, 'wp.update', 'workpapers', wp_id, row_to_dict(before), row_to_dict(after), self._client_ip())
+        return self._send(200, {'workpaper': row_to_dict(after)})
+
+    def _delete_workpaper(self, conn, user, wp_id):
+        if not has_permission(user['role'], 'wp.write'):
+            raise PermissionError('missing wp.write')
+        before = conn.execute('SELECT * FROM workpapers WHERE id=?', (wp_id,)).fetchone()
+        if not before:
+            return self._send(404, {'error': 'not_found'})
+        if before['status'] == 'locked' and not has_permission(user['role'], '*'):
+            raise PermissionError('a locked workpaper cannot be deleted')
+        conn.execute('DELETE FROM workpapers WHERE id=?', (wp_id,))
+        conn.commit()
+        audit(conn, user, 'wp.delete', 'workpapers', wp_id, row_to_dict(before), None, self._client_ip())
+        return self._send(200, {'ok': True})
+
+    def _transition_workpaper(self, conn, user, wp_id):
+        row = conn.execute('SELECT * FROM workpapers WHERE id=?', (wp_id,)).fetchone()
+        if not row:
+            return self._send(404, {'error': 'not_found'})
+        action = (self._body_json().get('action') or '').strip()
+        admin = has_permission(user['role'], '*')
+        preparer = row['prepared_by']
+
+        if action == 'review':
+            if not has_permission(user['role'], 'wp.review') and not admin:
+                raise PermissionError('reviewing requires wp.review')
+            if row['status'] != 'prepared':
+                raise ValueError('only a prepared workpaper can be reviewed')
+            if preparer == user['id'] and not admin:
+                raise PermissionError('segregation of duties: the preparer cannot review their own workpaper')
+            conn.execute('UPDATE workpapers SET status=?, reviewed_by=?, reviewed_by_name=?, reviewed_at=?, updated_at=? WHERE id=?',
+                         ('reviewed', user['id'], user['username'], now_iso(), now_iso(), wp_id))
+        elif action == 'approve':
+            if not has_permission(user['role'], 'wp.approve') and not admin:
+                raise PermissionError('approving requires wp.approve')
+            if row['status'] != 'reviewed':
+                raise ValueError('only a reviewed workpaper can be approved')
+            if preparer == user['id'] and not admin:
+                raise PermissionError('segregation of duties: the preparer cannot approve their own workpaper')
+            conn.execute('UPDATE workpapers SET status=?, approved_by=?, approved_by_name=?, approved_at=?, updated_at=? WHERE id=?',
+                         ('approved', user['id'], user['username'], now_iso(), now_iso(), wp_id))
+        elif action == 'lock':
+            if not has_permission(user['role'], 'wp.approve') and not admin:
+                raise PermissionError('locking requires wp.approve')
+            if row['status'] != 'approved':
+                raise ValueError('only an approved workpaper can be locked')
+            conn.execute('UPDATE workpapers SET status=?, locked_at=?, updated_at=? WHERE id=?',
+                         ('locked', now_iso(), now_iso(), wp_id))
+        elif action == 'reopen':
+            if not has_permission(user['role'], 'wp.write') and not admin:
+                raise PermissionError('reopening requires wp.write')
+            if row['status'] != 'locked':
+                raise ValueError('only a locked workpaper is reopened into a new version')
+            cur = conn.execute(
+                'INSERT INTO workpapers (engagement_ref, title, objective, procedure, comments, status, version, '
+                'prepared_by, prepared_by_name, created_by, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+                (row['engagement_ref'], row['title'], row['objective'], row['procedure'], row['comments'],
+                 'prepared', (row['version'] or 1) + 1, user['id'], user['username'], user['id'], now_iso(), now_iso()))
+            conn.commit()
+            newrow = conn.execute('SELECT * FROM workpapers WHERE id=?', (cur.lastrowid,)).fetchone()
+            audit(conn, user, 'wp.reopen', 'workpapers', cur.lastrowid, {'from_id': wp_id}, row_to_dict(newrow), self._client_ip())
+            return self._send(201, {'workpaper': row_to_dict(newrow)})
+        else:
+            raise ValueError('action must be one of review|approve|lock|reopen')
+
+        conn.commit()
+        after = conn.execute('SELECT * FROM workpapers WHERE id=?', (wp_id,)).fetchone()
+        audit(conn, user, 'wp.' + action, 'workpapers', wp_id, row_to_dict(row), row_to_dict(after), self._client_ip())
+        return self._send(200, {'workpaper': row_to_dict(after)})
+
+    # ---- Data-quality / validation engine ----
+    def _validate_data(self, conn, user):
+        if not has_permission(user['role'], 'data.validate'):
+            raise PermissionError('missing data.validate')
+        body = self._body_json()
+        ds = body.get('dataset') or {}
+        opts = body.get('options') or {}
+        threshold = float(opts.get('manual_threshold', 10000))
+        checks = []
+
+        def num(x):
+            try:
+                return float(x)
+            except Exception:
+                return 0.0
+
+        journals = ds.get('journal_entries') or []
+        if journals:
+            td = sum(num(j.get('debit')) for j in journals)
+            tc = sum(num(j.get('credit')) for j in journals)
+            diff = round(td - tc, 2)
+            checks.append({'rule': 'trial_balance_unbalanced', 'severity': 'high' if abs(diff) > 0.01 else 'ok',
+                           'count': 1 if abs(diff) > 0.01 else 0,
+                           'detail': {'total_debit': round(td, 2), 'total_credit': round(tc, 2), 'difference': diff}})
+            large = [j for j in journals if j.get('is_manual') and abs(num(j.get('amount'))) > threshold]
+            checks.append({'rule': 'large_manual_entries', 'severity': 'medium' if large else 'ok',
+                           'count': len(large), 'threshold': threshold, 'sample': large[:10]})
+
+        invoices = ds.get('invoices') or []
+        if invoices:
+            seen, dups = {}, []
+            for inv in invoices:
+                key = (str(inv.get('vendor_id')), str(inv.get('invoice_number')))
+                seen[key] = seen.get(key, 0) + 1
+            dup_keys = [k for k, v in seen.items() if v > 1]
+            for inv in invoices:
+                if (str(inv.get('vendor_id')), str(inv.get('invoice_number'))) in dup_keys:
+                    dups.append(inv)
+            checks.append({'rule': 'duplicate_invoices', 'severity': 'high' if dup_keys else 'ok',
+                           'count': len(dup_keys), 'sample': dups[:10]})
+            no_po = [inv for inv in invoices if not inv.get('po_number')]
+            checks.append({'rule': 'invoices_without_po', 'severity': 'medium' if no_po else 'ok',
+                           'count': len(no_po), 'sample': no_po[:10]})
+
+        accounts = ds.get('accounts') or []
+        if accounts:
+            neg = [a for a in accounts if num(a.get('balance')) < 0]
+            checks.append({'rule': 'negative_balances', 'severity': 'medium' if neg else 'ok',
+                           'count': len(neg), 'sample': neg[:10]})
+
+        issues = sum(1 for c in checks if c['count'] > 0)
+        audit(conn, user, 'data.validate', 'validation', None, None,
+              {'rules_run': len(checks), 'rules_with_issues': issues}, self._client_ip())
+        return self._send(200, {'checks': checks, 'summary': {'rules_run': len(checks), 'rules_with_issues': issues,
+                                                              'passed': issues == 0}})
+
     # ---- entities ----
     def _list_entities(self, conn, user, entity):
         perm = ENTITY_PERM[entity] + '.read'
         if not has_permission(user['role'], perm):
             raise PermissionError('missing ' + perm)
-        rows = conn.execute('SELECT * FROM %s ORDER BY id DESC' % entity).fetchall()
+        table = ENTITY_TABLE[entity]
+        rows = conn.execute('SELECT * FROM %s ORDER BY id DESC' % table).fetchall()
         return self._send(200, {entity: [row_to_dict(r) for r in rows]})
 
     def _create_entity(self, conn, user, entity):
         perm = ENTITY_PERM[entity] + '.write'
         if not has_permission(user['role'], perm):
             raise PermissionError('missing ' + perm)
+        table = ENTITY_TABLE[entity]
         data = self._body_json()
         fields = ENTITY_FIELDS[entity]
         if not (data.get('title') or '').strip():
@@ -816,17 +1079,18 @@ class Handler(BaseHTTPRequestHandler):
         cols = provided + ['created_by', 'created_at', 'updated_at']
         vals = [data[f] for f in provided] + [user['id'], now_iso(), now_iso()]
         placeholders = ','.join('?' for _ in cols)
-        cur = conn.execute('INSERT INTO %s (%s) VALUES (%s)' % (entity, ','.join(cols), placeholders), vals)
+        cur = conn.execute('INSERT INTO %s (%s) VALUES (%s)' % (table, ','.join(cols), placeholders), vals)
         conn.commit()
-        row = conn.execute('SELECT * FROM %s WHERE id=?' % entity, (cur.lastrowid,)).fetchone()
-        audit(conn, user, entity[:-1] + '.create', entity, cur.lastrowid, None, row_to_dict(row), self._client_ip())
+        row = conn.execute('SELECT * FROM %s WHERE id=?' % table, (cur.lastrowid,)).fetchone()
+        audit(conn, user, ENTITY_PERM[entity] + '.create', entity, cur.lastrowid, None, row_to_dict(row), self._client_ip())
         return self._send(201, {'item': row_to_dict(row)})
 
     def _update_entity(self, conn, user, entity, ent_id):
         perm = ENTITY_PERM[entity] + '.write'
         if not has_permission(user['role'], perm):
             raise PermissionError('missing ' + perm)
-        before = conn.execute('SELECT * FROM %s WHERE id=?' % entity, (ent_id,)).fetchone()
+        table = ENTITY_TABLE[entity]
+        before = conn.execute('SELECT * FROM %s WHERE id=?' % table, (ent_id,)).fetchone()
         if not before:
             return self._send(404, {'error': 'not_found'})
         data = self._body_json()
@@ -851,22 +1115,23 @@ class Handler(BaseHTTPRequestHandler):
         sets.append('updated_at=?')
         vals.append(now_iso())
         vals.append(ent_id)
-        conn.execute('UPDATE %s SET %s WHERE id=?' % (entity, ','.join(sets)), vals)
+        conn.execute('UPDATE %s SET %s WHERE id=?' % (table, ','.join(sets)), vals)
         conn.commit()
-        after = conn.execute('SELECT * FROM %s WHERE id=?' % entity, (ent_id,)).fetchone()
-        audit(conn, user, entity[:-1] + '.update', entity, ent_id, row_to_dict(before), row_to_dict(after), self._client_ip())
+        after = conn.execute('SELECT * FROM %s WHERE id=?' % table, (ent_id,)).fetchone()
+        audit(conn, user, ENTITY_PERM[entity] + '.update', entity, ent_id, row_to_dict(before), row_to_dict(after), self._client_ip())
         return self._send(200, {'item': row_to_dict(after)})
 
     def _delete_entity(self, conn, user, entity, ent_id):
         perm = ENTITY_PERM[entity] + '.write'
         if not has_permission(user['role'], perm):
             raise PermissionError('missing ' + perm)
-        before = conn.execute('SELECT * FROM %s WHERE id=?' % entity, (ent_id,)).fetchone()
+        table = ENTITY_TABLE[entity]
+        before = conn.execute('SELECT * FROM %s WHERE id=?' % table, (ent_id,)).fetchone()
         if not before:
             return self._send(404, {'error': 'not_found'})
-        conn.execute('DELETE FROM %s WHERE id=?' % entity, (ent_id,))
+        conn.execute('DELETE FROM %s WHERE id=?' % table, (ent_id,))
         conn.commit()
-        audit(conn, user, entity[:-1] + '.delete', entity, ent_id, row_to_dict(before), None, self._client_ip())
+        audit(conn, user, ENTITY_PERM[entity] + '.delete', entity, ent_id, row_to_dict(before), None, self._client_ip())
         return self._send(200, {'ok': True})
 
 

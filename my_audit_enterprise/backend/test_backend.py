@@ -183,6 +183,74 @@ def main():
     except ImportError:
         print('  (skip crypto round-trip: run from the backend directory to import the module)')
 
+    # ================= Audit Universe + Annual Plan =================
+    st, u, _ = call('POST', '/api/universe', {'title': 'دورة المشتريات', 'department': 'المالية', 'risk_score': 20}, aud_ck)
+    check(st == 201, 'internal_auditor creates an audit-universe activity (201)')
+    act_id = u['item']['id']
+    st, body, _ = call('GET', '/api/universe', None, view_ck)
+    check(st == 200 and any(x['id'] == act_id for x in body['universe']), 'viewer can read the audit universe')
+    st, pl, _ = call('POST', '/api/plans', {'title': 'مراجعة المشتريات', 'fiscal_year': '2026', 'activity_id': act_id,
+                                           'quarter': 'Q1', 'priority': 'عالية', 'planned_hours': 80, 'status': 'مخطط'}, aud_ck)
+    check(st == 201, 'internal_auditor adds an item to the annual audit plan (201)')
+    st, body, _ = call('POST', '/api/plans', {'title': 'x'}, ext_ck)
+    check(st == 403, 'external_auditor cannot write to the audit plan (403)')
+
+    # ================= Engagements + Workpaper lifecycle =================
+    st, eng, _ = call('POST', '/api/engagements', {'title': 'IA-2026-003 مراجعة المشتريات', 'objective': 'فحص ضوابط الشراء',
+                                                   'period_from': '2026-01-01', 'period_to': '2026-03-31', 'status': 'تخطيط',
+                                                   'lead_auditor': 'auditor1'}, aud_ck)
+    check(st == 201, 'internal_auditor opens an engagement (201)')
+    eng_id = eng['item']['id']
+    st, wp, _ = call('POST', '/api/workpapers', {'engagement_ref': eng_id, 'title': 'WP-PUR-005 اختبار 3-way match',
+                                                'objective': 'التحقق من مطابقة الفاتورة/الأمر/الاستلام', 'procedure': 'عينة 25'}, aud_ck)
+    check(st == 201 and wp['workpaper']['status'] == 'prepared', 'auditor prepares a workpaper (status=prepared)')
+    wp_id = wp['workpaper']['id']
+    # SoD: preparer cannot review own workpaper
+    st, body, _ = call('POST', '/api/workpapers/%d/transition' % wp_id, {'action': 'review'}, aud_ck)
+    check(st == 403, 'preparer cannot review own workpaper (403 — SoD)')
+    # manager reviews
+    st, body, _ = call('POST', '/api/workpapers/%d/transition' % wp_id, {'action': 'review'}, mgr_ck)
+    check(st == 200 and body['workpaper']['status'] == 'reviewed', 'manager reviews the workpaper (status=reviewed)')
+    # auditor cannot approve (no wp.approve)
+    st, body, _ = call('POST', '/api/workpapers/%d/transition' % wp_id, {'action': 'approve'}, aud_ck)
+    check(st == 403, 'auditor cannot approve (403 — missing wp.approve)')
+    # manager approves and locks
+    st, body, _ = call('POST', '/api/workpapers/%d/transition' % wp_id, {'action': 'approve'}, mgr_ck)
+    check(st == 200 and body['workpaper']['status'] == 'approved', 'manager approves the workpaper (status=approved)')
+    st, body, _ = call('POST', '/api/workpapers/%d/transition' % wp_id, {'action': 'lock'}, mgr_ck)
+    check(st == 200 and body['workpaper']['status'] == 'locked', 'manager locks the workpaper (status=locked)')
+    # locked workpaper is immutable
+    st, body, _ = call('PUT', '/api/workpapers/%d' % wp_id, {'comments': 'edit'}, aud_ck)
+    check(st == 403, 'a locked workpaper cannot be edited (403)')
+    # reopen creates a new version
+    st, nv, _ = call('POST', '/api/workpapers/%d/transition' % wp_id, {'action': 'reopen'}, aud_ck)
+    check(st == 201 and nv['workpaper']['version'] == 2 and nv['workpaper']['status'] == 'prepared',
+          'reopen creates version 2 in prepared status')
+
+    # ================= Data-quality / validation engine =================
+    dataset = {
+        'journal_entries': [
+            {'debit': 1000, 'credit': 0}, {'debit': 0, 'credit': 900},
+            {'is_manual': True, 'amount': 50000, 'debit': 50000, 'credit': 0}
+        ],
+        'invoices': [
+            {'vendor_id': 'V1', 'invoice_number': 'INV-1', 'amount': 100, 'po_number': 'PO-1'},
+            {'vendor_id': 'V1', 'invoice_number': 'INV-1', 'amount': 100, 'po_number': 'PO-1'},
+            {'vendor_id': 'V2', 'invoice_number': 'INV-9', 'amount': 200, 'po_number': None}
+        ],
+        'accounts': [{'account_id': 'A1', 'balance': -50}, {'account_id': 'A2', 'balance': 500}]
+    }
+    st, v, _ = call('POST', '/api/validate', {'dataset': dataset, 'options': {'manual_threshold': 10000}}, aud_ck)
+    check(st == 200, 'internal_auditor runs the validation engine (200)')
+    rules = {c['rule']: c for c in v['checks']}
+    check(rules['trial_balance_unbalanced']['count'] == 1, 'validation flags the unbalanced trial balance')
+    check(rules['duplicate_invoices']['count'] == 1, 'validation flags the duplicate invoice')
+    check(rules['invoices_without_po']['count'] == 1, 'validation flags the invoice without a PO')
+    check(rules['large_manual_entries']['count'] == 1, 'validation flags the large manual entry')
+    check(rules['negative_balances']['count'] == 1, 'validation flags the negative balance')
+    st, body, _ = call('POST', '/api/validate', {'dataset': {}}, ext_ck)
+    check(st == 403, 'external_auditor cannot run data validation (403)')
+
     print('\nALL %d CHECKS PASSED' % _checks)
 
 

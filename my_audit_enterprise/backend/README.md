@@ -26,8 +26,11 @@
 | **تقرير لجنة المراجعة** (تجميع المخاطر/الضوابط/الملاحظات/PBC) | ✅ (مرحلة ٢) |
 | **بوابة المراجع الخارجي + قائمة PBC** بدورة (طلب ← تجهيز ← مراجعة) | ✅ (مرحلة ٣) |
 | **النسخ الاحتياطي المشفّر** (PBKDF2 + تشفير ثم مصادقة HMAC) | ✅ (مرحلة ٣) |
+| **سجل الأنشطة (Audit Universe) + الخطة السنوية** المبنية على المخاطر | ✅ |
+| **ملفات المراجعة (Engagements) + دورة أوراق العمل** (إعداد←مراجعة←اعتماد←قفل) مع الإصدارات والفصل الوظيفي | ✅ |
+| **محرّك جودة وتحقق البيانات** (ميزان غير متوازن، فواتير مكررة/بلا PO، قيود يدوية كبيرة، أرصدة سالبة) | ✅ |
 
-تم إنجاز المراحل الثلاث (١–٣) من أساس إعادة البناء. يبقى للتوسّع لاحقاً: الترحيل إلى
+تم إنجاز أساس إعادة البناء بكامل وحداته. يبقى للتوسّع لاحقاً: الترحيل إلى
 FastAPI + PostgreSQL، وربط الواجهة الحالية (SPA) بهذه الـ API تدريجياً.
 
 ---
@@ -51,7 +54,7 @@ python3 audit_backend.py          # يستمع على http://localhost:8090
 
 عند أول تشغيل بلا مستخدمين يُنشأ `admin / admin123` — **غيّره فوراً**.
 
-الاختبارات الشاملة (٤٢ تحققاً: مصادقة، منع صلاحيات، فصل وظيفي، سجل تدقيق، أدلة وبصماتها، تقرير اللجنة، دورة PBC، والنسخ المشفّر ودورة فك تشفيره):
+الاختبارات الشاملة (٦٢ تحققاً: مصادقة، منع صلاحيات، فصل وظيفي، سجل تدقيق، أدلة وبصماتها، تقرير اللجنة، دورة PBC، النسخ المشفّر، سجل الأنشطة والخطة، دورة أوراق العمل، ومحرّك التحقق):
 
 ```bash
 MY_AUDIT_BACKEND_DB=/tmp/t.db MY_AUDIT_BACKEND_PORT=8091 python3 audit_backend.py &
@@ -77,8 +80,12 @@ BASE=http://localhost:8091 python3 test_backend.py
 - `internal_auditor`: `evidence.read/write` · `pbc.fulfill` · `report.read`
 - `manager`: `evidence.read` · `pbc.fulfill` · `report.read`
 - `external_auditor`: `evidence.read` · `pbc.request` · `pbc.review` · `report.read`
-- `viewer`: `report.read`
+- `viewer`: `report.read` · `universe.read` · `plan.read` · `engagement.read` · `wp.read`
 - `admin`: كل ما سبق + `evidence.delete` و`backup.run`
+
+**صلاحيات المراجعة الداخلية الموسّعة:**
+- `internal_auditor`: `universe.read/write` · `plan.read/write` · `engagement.read/write` · `wp.read/write` · `wp.review` · `data.validate`
+- `manager`: `universe.read` · `plan.read/write` · `engagement.read` · `wp.read` · `wp.review` · `wp.approve` · `data.validate`
 
 ---
 
@@ -107,7 +114,21 @@ BASE=http://localhost:8091 python3 test_backend.py
 | GET | `/api/pbc` | `pbc.*` | قائمة طلبات PBC |
 | PUT | `/api/pbc/{id}` | `pbc.fulfill` (تجهيز) / `pbc.review` (قبول/رفض) | تحديث حالة الطلب |
 | POST | `/api/backup` | admin | نسخة احتياطية مشفّرة من القاعدة |
+| GET/POST | `/api/universe` | `universe.read`/`universe.write` | سجل الأنشطة القابلة للمراجعة |
+| PUT/DELETE | `/api/universe/{id}` | `universe.write` | تعديل/حذف نشاط |
+| GET/POST | `/api/plans` | `plan.read`/`plan.write` | الخطة السنوية للمراجعة |
+| PUT/DELETE | `/api/plans/{id}` | `plan.write` | تعديل/حذف بند خطة |
+| GET/POST | `/api/engagements` | `engagement.read`/`engagement.write` | ملفات المراجعة |
+| PUT/DELETE | `/api/engagements/{id}` | `engagement.write` | تعديل/حذف ملف مراجعة |
+| GET/POST | `/api/workpapers` | `wp.read`/`wp.write` | أوراق العمل (فلترة `?engagement_ref=`) |
+| PUT/DELETE | `/api/workpapers/{id}` | `wp.write` (يُمنع تعديل المقفلة) | تعديل/حذف ورقة عمل |
+| POST | `/api/workpapers/{id}/transition` | `wp.review`/`wp.approve`/`wp.write` | نقل الحالة (review/approve/lock/reopen) |
+| POST | `/api/validate` | `data.validate` | محرّك جودة وتحقق البيانات |
 | GET | `/health` | عام | فحص الجاهزية |
+
+**دورة أوراق العمل:** `prepared → reviewed → approved → locked`. المراجعة والاعتماد يشترطان **الفصل الوظيفي** (المُراجِع/المُعتمِد ≠ المُعِدّ). الورقة المقفلة غير قابلة للتعديل؛ و`reopen` يُنشئ **نسخة جديدة** (version+1) في حالة `prepared` مع بقاء المقفلة كما هي.
+
+**محرّك التحقق:** يُرسَل `POST /api/validate` بجسم `{dataset:{journal_entries, invoices, accounts}, options:{manual_threshold}}` فيُعيد قائمة نتائج لكل قاعدة (عدد الحالات وعيّنة منها): توازن الميزان، الفواتير المكررة، الفواتير دون أمر شراء، القيود اليدوية الكبيرة، والأرصدة السالبة.
 
 **دورة PBC:** المراجع الخارجي يُنشئ الطلب (`requested`) ← المراجع الداخلي/المالك يُجهّزه ويرفع الأدلة (`in_progress`/`submitted`) ← المراجع الخارجي يقبله أو يرفضه (`accepted`/`rejected`). كل انتقال محكوم بصلاحية مختلفة (فصل بين طرفي الطلب).
 
