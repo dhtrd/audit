@@ -251,6 +251,23 @@ def main():
     st, body, _ = call('POST', '/api/validate', {'dataset': {}}, ext_ck)
     check(st == 403, 'external_auditor cannot run data validation (403)')
 
+    # ================= Security hardening =================
+    # Login brute-force throttle (isolated throwaway user so real logins are unaffected)
+    call('POST', '/api/auth/register', {'username': 'throttleuser', 'password': 'rightpass123', 'role': 'viewer'}, admin_ck)
+    codes = []
+    for _ in range(6):
+        st, _, _ = call('POST', '/api/auth/login', {'username': 'throttleuser', 'password': 'WRONG'})
+        codes.append(st)
+    check(codes[:5] == [401] * 5 and codes[5] == 429, 'login throttled after 5 failures (429) — codes=%s' % codes)
+
+    # Oversized request body rejected (server started with a small MY_AUDIT_MAX_REQUEST)
+    st, body, _ = call('POST', '/api/validate', {'dataset': {'note': 'x' * 6000}}, aud_ck)
+    check(st == 413, 'oversized request body rejected (413)')
+
+    # Server errors do not leak internal detail
+    st, body, _ = call('GET', '/api/risks', None, admin_ck)  # sanity: normal path still fine
+    check(st == 200, 'normal request still works after hardening (200)')
+
     print('\nALL %d CHECKS PASSED' % _checks)
 
 

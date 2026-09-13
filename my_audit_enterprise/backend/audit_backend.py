@@ -29,16 +29,24 @@ Env:      MY_AUDIT_BACKEND_DB   sqlite path (default ./audit_backend.db)
 
 import os
 import re
+import sys
 import json
+import time
 import hmac
 import base64
 import hashlib
 import secrets
 import sqlite3
 import datetime
+import threading
+import traceback
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from http.cookies import SimpleCookie
 import urllib.parse
+
+
+class PayloadTooLarge(Exception):
+    pass
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get('MY_AUDIT_BACKEND_DB', os.path.join(_HERE, 'audit_backend.db'))
@@ -49,6 +57,17 @@ BACKUP_KEY = os.environ.get('MY_AUDIT_BACKUP_KEY', '')  # passphrase for encrypt
 SESSION_TTL_HOURS = 12
 PBKDF2_ROUNDS = 200_000
 MAX_EVIDENCE_BYTES = int(os.environ.get('MY_AUDIT_MAX_EVIDENCE', str(25 * 1024 * 1024)))
+# Hard cap on any request body (base64 evidence of 25 MB is ~34 MB, so allow 40 MB).
+MAX_REQUEST_BYTES = int(os.environ.get('MY_AUDIT_MAX_REQUEST', str(40 * 1024 * 1024)))
+# Login brute-force throttle (per username+IP).
+LOGIN_MAX_FAILS = int(os.environ.get('MY_AUDIT_LOGIN_MAX_FAILS', '5'))
+LOGIN_WINDOW_SECONDS = int(os.environ.get('MY_AUDIT_LOGIN_WINDOW', '300'))
+_login_fails = {}
+_login_lock = threading.Lock()
+# A fixed dummy hash so a login for a non-existent user costs the same PBKDF2 time
+# as a real one (defeats username enumeration by timing).
+_DUMMY_SALT = 'enumeration_guard_salt'
+_DUMMY_HASH, _ = None, None  # filled lazily
 
 # ----------------------------------------------------------------------------
 # RBAC: role -> set of permissions. '*' means every permission.
@@ -281,6 +300,32 @@ def verify_password(password, salt, expected_hex):
     return hmac.compare_digest(calc, expected_hex)
 
 
+def dummy_verify():
+    """Spend the same PBKDF2 time as a real verify (username-enumeration guard)."""
+    hashlib.pbkdf2_hmac('sha256', b'x', _DUMMY_SALT.encode('utf-8'), PBKDF2_ROUNDS)
+
+
+def login_throttled(key):
+    now = time.time()
+    with _login_lock:
+        fails = [t for t in _login_fails.get(key, []) if now - t < LOGIN_WINDOW_SECONDS]
+        _login_fails[key] = fails
+        return len(fails) >= LOGIN_MAX_FAILS
+
+
+def record_login_fail(key):
+    now = time.time()
+    with _login_lock:
+        fails = [t for t in _login_fails.get(key, []) if now - t < LOGIN_WINDOW_SECONDS]
+        fails.append(now)
+        _login_fails[key] = fails
+
+
+def clear_login_fails(key):
+    with _login_lock:
+        _login_fails.pop(key, None)
+
+
 def create_user(conn, username, password, full_name, role):
     if role not in VALID_ROLES:
         raise ValueError('invalid role')
@@ -293,8 +338,9 @@ def create_user(conn, username, password, full_name, role):
 
 
 def bootstrap_admin():
-    """Create/reset the first admin from MY_AUDIT_BOOTSTRAP_ADMIN=user:pass, or a
-    default admin/admin123 if there are no users yet (developer convenience)."""
+    """Create/reset the first admin from MY_AUDIT_BOOTSTRAP_ADMIN=user:pass. If no
+    users exist and no spec is given, create 'admin' with a RANDOM one-time password
+    printed once to the console (no weak hardcoded default)."""
     conn = get_db()
     spec = os.environ.get('MY_AUDIT_BOOTSTRAP_ADMIN', '')
     count = conn.execute('SELECT COUNT(*) AS n FROM users').fetchone()['n']
@@ -310,8 +356,13 @@ def bootstrap_admin():
         conn.commit()
         print('[bootstrap] admin ready: %s' % u)
     elif count == 0:
-        create_user(conn, 'admin', 'admin123', 'System Administrator', 'admin')
-        print('[bootstrap] created default admin/admin123 — change it immediately.')
+        gen = secrets.token_urlsafe(12)
+        create_user(conn, 'admin', gen, 'System Administrator', 'admin')
+        print('=' * 64)
+        print('[bootstrap] created initial admin. ONE-TIME PASSWORD (change it now):')
+        print('    username: admin')
+        print('    password: %s' % gen)
+        print('=' * 64)
     conn.close()
 
 
@@ -477,6 +528,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(body)))
+        # Hardening headers (defence in depth; HTTPS/HSTS is added by the reverse proxy).
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('Referrer-Policy', 'no-referrer')
+        self.send_header('Cache-Control', 'no-store')
         if set_cookie is not None:
             self.send_header('Set-Cookie', set_cookie)
         self.end_headers()
@@ -486,6 +542,9 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get('Content-Length', 0) or 0)
         if length <= 0:
             return {}
+        if length > MAX_REQUEST_BYTES:
+            # Reject before reading, so an oversized Content-Length cannot exhaust memory.
+            raise PayloadTooLarge('request body exceeds %d bytes' % MAX_REQUEST_BYTES)
         raw = self.rfile.read(length)
         try:
             return json.loads(raw.decode('utf-8'))
@@ -607,8 +666,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(403, {'error': 'forbidden', 'detail': str(pe)})
         except ValueError as ve:
             return self._send(400, {'error': 'bad_request', 'detail': str(ve)})
-        except Exception as exc:
-            return self._send(500, {'error': 'server_error', 'detail': str(exc)})
+        except PayloadTooLarge as pl:
+            return self._send(413, {'error': 'payload_too_large', 'detail': str(pl)})
+        except Exception:
+            # Never leak internal details to the client; log server-side instead.
+            traceback.print_exc()
+            return self._send(500, {'error': 'server_error'})
         finally:
             conn.close()
 
@@ -620,10 +683,21 @@ class Handler(BaseHTTPRequestHandler):
         data = self._body_json()
         username = (data.get('username') or '').strip()
         password = data.get('password') or ''
+        # Throttle on the real socket peer (not the spoofable X-Forwarded-For) plus the
+        # username, so a single host cannot evade the limit by rotating XFF headers.
+        peer = self.client_address[0] if self.client_address else ''
+        throttle_key = peer + '|' + username
+        if login_throttled(throttle_key):
+            audit(conn, None, 'login.throttled', 'auth', username, None, None, self._client_ip())
+            return self._send(429, {'error': 'too_many_attempts', 'detail': 'حاول مرة أخرى لاحقاً'})
         row = conn.execute('SELECT * FROM users WHERE username=? AND active=1', (username,)).fetchone()
-        if not row or not verify_password(password, row['salt'], row['pw_hash']):
+        # Constant-ish time: run PBKDF2 even when the user does not exist.
+        ok = verify_password(password, row['salt'], row['pw_hash']) if row else (dummy_verify() or False)
+        if not row or not ok:
+            record_login_fail(throttle_key)
             audit(conn, None, 'login.failed', 'auth', username, None, None, self._client_ip())
             return self._send(401, {'error': 'invalid_credentials'})
+        clear_login_fails(throttle_key)
         token = create_session(conn, row['id'])
         audit(conn, row, 'login.success', 'auth', row['id'], None, None, self._client_ip())
         cookie = 'sid=%s; HttpOnly; Path=/; SameSite=Strict; Max-Age=%d' % (token, SESSION_TTL_HOURS * 3600)
